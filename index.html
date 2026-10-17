@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Erlaubt Verbindungen NUR zu OpenRouter und ElevenLabs. Neuer Anbieter (z. B. Gemini) = Adresse hier ergänzen. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://openrouter.ai https://api.elevenlabs.io; media-src blob: data:">
+<title>Apollo Test</title>
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;background:#0b0d10;color:#e8eaed;font:16px system-ui,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+header{display:flex;justify-content:space-between;align-items:center;padding:10px 14px}
+h1{font-size:18px;margin:0}
+button,input,select{font:inherit;color:inherit}
+button{background:#1d2330;border:1px solid #2c3442;border-radius:10px;padding:8px 12px}
+input,select{background:#161a1f;border:1px solid #2c3442;border-radius:10px;padding:10px;width:100%}
+#log{flex:1;overflow:auto;padding:8px 14px;display:flex;flex-direction:column;gap:8px}
+.m{max-width:85%;padding:8px 12px;border-radius:14px;white-space:pre-wrap;word-break:break-word}
+.user{align-self:flex-end;background:#2b4a8a}
+.bot{align-self:flex-start;background:#1d2330}
+.sys{align-self:center;color:#e0a060;font-size:13px;text-align:center}
+#orbwrap{text-align:center;padding:8px}
+#orb{width:110px;height:110px;border-radius:50%;border:0;background:radial-gradient(#7aa2ff,#2b4a8a)}
+#orb.listening{background:radial-gradient(#6fe3a0,#1f7a4a);animation:p 1s infinite alternate}
+#orb.thinking{background:radial-gradient(#ffd27a,#9a6a1a);animation:p .6s infinite alternate}
+#orb.speaking{background:radial-gradient(#ff9ab0,#9a2a4a);animation:p .8s infinite alternate}
+@keyframes p{to{transform:scale(1.1)}}
+#state{color:#8a9099;font-size:13px;margin-top:6px}
+.row{display:flex;gap:8px;padding:8px 14px}
+#set{position:fixed;inset:0;background:#0b0d10;overflow:auto;padding:16px;display:none;z-index:5}
+#set.open{display:block}
+label{display:block;margin:14px 0 4px;color:#8a9099;font-size:13px}
+small{color:#8a9099;display:block;margin-top:6px}
+</style>
+</head>
+<body>
+<header><h1>Apollo · Test</h1><button id="gear">⚙ Einstellungen</button></header>
+<div id="log"></div>
+<div id="orbwrap"><button id="orb" aria-label="Sprechen"></button><div id="state"></div></div>
+<div class="row"><input id="txt" placeholder="Nachricht tippen …" autocomplete="off"><button id="send">Senden</button></div>
+
+<div id="set">
+  <button id="close">✕ Schließen</button>
+  <label>Denk-Anbieter</label><select id="provider"></select>
+  <label>OpenRouter-Key</label><input id="orKey" type="password" autocomplete="off" placeholder="Key einfügen">
+  <label>Modell (OpenRouter)</label><input id="model" autocomplete="off" autocapitalize="off">
+  <small>Kostenlose Modelle enden auf „:free“. Aktuelle Namen stehen auf openrouter.ai/models.</small>
+  <label>ElevenLabs-Key</label><input id="xiKey" type="password" autocomplete="off" placeholder="Key einfügen">
+  <label>Stimmen-ID (Jonas)</label><input id="voice" autocomplete="off" autocapitalize="off" placeholder="wird automatisch eingetragen">
+  <p><button id="find">Stimme „Jonas“ suchen</button></p>
+  <small id="vstat"></small>
+  <p><button id="wipe">Alle Keys von diesem Gerät löschen</button></p>
+  <small>Keys werden nur im localStorage dieses Geräts gespeichert und nur an OpenRouter bzw. ElevenLabs gesendet.</small>
+</div>
+<audio id="player"></audio>
+
+<script>
+const $=id=>document.getElementById(id);
+const LS='apollo_settings';
+const SYS='Du bist Apollo, ein hilfreicher Sprachassistent. Antworte auf Deutsch, kurz und natürlich (max. 3 Sätze), ohne Markdown.';
+function load(){try{return JSON.parse(localStorage.getItem(LS))||{}}catch(e){return{}}}
+const S=Object.assign({provider:'openrouter',model:'meta-llama/llama-3.3-70b-instruct:free',orKey:'',xiKey:'',voiceId:''},load());
+function save(){try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){say('sys','Speichern nicht möglich (privater Modus?)')}}
+
+/* JSON-Helfer mit sauberer Fehlermeldung */
+async function jf(url,opts){
+  const r=await fetch(url,opts);let j={};
+  try{j=await r.json()}catch(e){}
+  if(!r.ok){const d=j.detail;throw new Error((typeof d==='string'?d:d&&d.message)||(j.error&&j.error.message)||'HTTP '+r.status)}
+  return j;
+}
+
+/* ---------- DENKEN: Anbieter-Struktur ----------
+   Neuer Anbieter = ein Eintrag mit label, key() und chat(messages).
+   Beispiel Gemini später (OpenAI-kompatibel):
+   gemini:{label:'Gemini',key:()=>S.gemKey,chat:m=>openaiChat('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',S.gemKey,'gemini-2.0-flash',m)}
+   (dazu: Eingabefeld + Adresse in der CSP oben ergänzen) */
+async function openaiChat(url,key,model,messages){
+  const j=await jf(url,{method:'POST',headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({model,messages})});
+  return (j.choices&&j.choices[0]&&j.choices[0].message.content||'').trim();
+}
+const PROVIDERS={
+  openrouter:{label:'OpenRouter',key:()=>S.orKey,
+    chat:m=>openaiChat('https://openrouter.ai/api/v1/chat/completions',S.orKey,S.model,m)}
+};
+
+/* ---------- UI ---------- */
+const LABELS={idle:'Tippen zum Sprechen',listening:'Ich höre … (nochmal tippen = fertig)',thinking:'Ich denke …',speaking:'Ich spreche … (tippen = stopp)'};
+let state='idle',rec=null,mr=null;const hist=[];
+function setState(s){state=s;$('orb').className=s;$('state').textContent=LABELS[s]}
+function say(role,text){const d=document.createElement('div');d.className='m '+role;d.textContent=text;$('log').appendChild(d);$('log').scrollTop=1e9}
+const player=$('player');
+function unlock(){player.src='data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';player.play().catch(()=>{})}
+
+/* ---------- HÖREN ---------- */
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+function listen(){SR?listenBrowser():listenScribe()}
+function listenBrowser(){
+  const r=new SR();rec=r;r.lang='de-DE';r.interimResults=false;
+  let got=false;setState('listening');
+  r.onresult=e=>{got=true;handle(e.results[0][0].transcript)};
+  r.onerror=e=>{
+    if(e.error==='no-speech'||e.error==='aborted')return;
+    got=true;
+    if(S.xiKey&&['network','service-not-allowed','language-not-supported'].includes(e.error)){say('sys','Browser-Erkennung nicht verfügbar → Fallback Scribe');listenScribe()}
+    else{say('sys','Spracherkennung: '+e.error);setState('idle')}
+  };
+  r.onend=()=>{if(!got&&state==='listening')setState('idle')};
+  try{r.start()}catch(e){setState('idle')}
+}
+async function listenScribe(){
+  if(!S.xiKey){say('sys','Für den Fallback fehlt der ElevenLabs-Key.');setState('idle');return}
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    const chunks=[];const m=new MediaRecorder(stream);mr=m;
+    m.ondataavailable=e=>chunks.push(e.data);
+    m.onstop=async()=>{
+      stream.getTracks().forEach(t=>t.stop());setState('thinking');
+      const type=m.mimeType||'audio/webm';
+      const fd=new FormData();fd.append('model_id','scribe_v1');fd.append('language_code','deu');
+      fd.append('file',new Blob(chunks,{type}),'a.'+(type.includes('mp4')?'mp4':'webm'));
+      try{
+        const j=await jf('https://api.elevenlabs.io/v1/speech-to-text',{method:'POST',headers:{'xi-api-key':S.xiKey},body:fd});
+        if(j.text&&j.text.trim())handle(j.text.trim());else{say('sys','Nichts verstanden.');setState('idle')}
+      }catch(e){say('sys','Scribe: '+e.message);setState('idle')}
+    };
+    m.start();setState('listening');
+  }catch(e){say('sys','Mikrofon: '+e.message);setState('idle')}
+}
+function stopListen(){try{if(rec)rec.stop()}catch(e){}try{if(mr&&mr.state==='recording')mr.stop()}catch(e){}}
+
+/* ---------- SPRECHEN ---------- */
+async function speak(text){
+  if(!S.xiKey||!S.voiceId)return;
+  setState('speaking');
+  try{
+    const r=await fetch('https://api.elevenlabs.io/v1/text-to-speech/'+encodeURIComponent(S.voiceId)+'?output_format=mp3_44100_128',
+      {method:'POST',headers:{'xi-api-key':S.xiKey,'Content-Type':'application/json'},body:JSON.stringify({text,model_id:'eleven_multilingual_v2'})});
+    if(!r.ok){let j={};try{j=await r.json()}catch(e){}const d=j.detail;throw new Error((typeof d==='string'?d:d&&d.message)||'HTTP '+r.status)}
+    const url=URL.createObjectURL(await r.blob());
+    player.onended=()=>{URL.revokeObjectURL(url);setState('idle')};
+    player.src=url;await player.play();
+  }catch(e){say('sys','Sprechen: '+e.message);setState('idle')}
+}
+async function findVoice(){
+  const st=t=>$('vstat').textContent=t;
+  if(!S.xiKey){st('Bitte zuerst den ElevenLabs-Key eintragen.');return}
+  st('Suche …');
+  try{
+    const h={'xi-api-key':S.xiKey};
+    let j=await jf('https://api.elevenlabs.io/v2/voices?search=Jonas&page_size=20',{headers:h});
+    let v=(j.voices||[]).find(x=>/jonas/i.test(x.name)),src='Meine Stimmen';
+    if(!v){
+      j=await jf('https://api.elevenlabs.io/v1/shared-voices?search=Jonas&language=de&page_size=20',{headers:h});
+      v=(j.voices||[]).find(x=>/jonas/i.test(x.name));src='Stimmen-Bibliothek';
+    }
+    if(!v){st('Keine Stimme „Jonas“ gefunden. ID von Hand eintragen.');return}
+    S.voiceId=$('voice').value=v.voice_id;save();
+    st('Gefunden: '+v.name+' ('+src+')'+(src==='Stimmen-Bibliothek'?'. Falls Sprechen scheitert: Stimme in ElevenLabs erst zu „Meine Stimmen“ hinzufügen.':''));
+  }catch(e){st('Fehler: '+e.message)}
+}
+
+/* ---------- ABLAUF ---------- */
+async function handle(text){
+  text=(text||'').trim();if(!text)return;
+  say('user',text);hist.push({role:'user',content:text});
+  const p=PROVIDERS[S.provider];
+  if(!p.key()){say('sys','Bitte zuerst den Key in den Einstellungen eintragen.');setState('idle');return}
+  setState('thinking');
+  try{
+    const reply=await p.chat([{role:'system',content:SYS}].concat(hist.slice(-20)));
+    if(!reply)throw new Error('Leere Antwort');
+    hist.push({role:'assistant',content:reply});say('bot',reply);
+    await speak(reply);
+  }catch(e){say('sys','Denken: '+e.message)}
+  if(state!=='speaking')setState('idle');
+}
+
+/* ---------- Events ---------- */
+$('orb').onclick=()=>{
+  unlock();
+  if(state==='listening'){stopListen();return}
+  if(state==='speaking'){player.pause();setState('idle');return}
+  if(state==='thinking')return;
+  listen();
+};
+$('send').onclick=()=>{const t=$('txt').value;$('txt').value='';unlock();handle(t)};
+$('txt').onkeydown=e=>{if(e.key==='Enter')$('send').click()};
+$('gear').onclick=()=>$('set').classList.add('open');
+$('close').onclick=()=>$('set').classList.remove('open');
+$('find').onclick=findVoice;
+$('wipe').onclick=()=>{try{localStorage.removeItem(LS)}catch(e){}S.orKey=S.xiKey=S.voiceId='';['orKey','xiKey','voice'].forEach(i=>$(i).value='');$('vstat').textContent='Gelöscht.'};
+for(const k in PROVIDERS){const o=document.createElement('option');o.value=k;o.textContent=PROVIDERS[k].label;$('provider').appendChild(o)}
+[['provider','provider'],['orKey','orKey'],['model','model'],['xiKey','xiKey'],['voice','voiceId']].forEach(([id,k])=>{
+  $(id).value=S[k];$(id).onchange=$(id).oninput=()=>{S[k]=$(id).value.trim();save()};
+});
+setState('idle');
+say('sys','Zum Start: ⚙ öffnen und die Keys eintragen.');
+</script>
+</body>
+</html>
