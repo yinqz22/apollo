@@ -26,6 +26,7 @@ input,select{background:#161a1f;border:1px solid #2c3442;border-radius:10px;padd
 #orb.thinking{background:radial-gradient(#ffd27a,#9a6a1a);animation:p .6s infinite alternate}
 #orb.speaking{background:radial-gradient(#ff9ab0,#9a2a4a);animation:p .8s infinite alternate}
 @keyframes p{to{transform:scale(1.1)}}
+@media(prefers-reduced-motion:reduce){#orb{animation:none!important}}
 #state{color:#8a9099;font-size:13px;margin-top:6px}
 .row{display:flex;gap:8px;padding:8px 14px}
 #set{position:fixed;inset:0;background:#0b0d10;overflow:auto;padding:16px;display:none;z-index:5}
@@ -45,10 +46,13 @@ small{color:#8a9099;display:block;margin-top:6px}
   <label>Denk-Anbieter</label><select id="provider"></select>
   <label>OpenRouter-Key</label><input id="orKey" type="password" autocomplete="off" placeholder="Key einfügen">
   <label>Modell (OpenRouter)</label><input id="model" autocomplete="off" autocapitalize="off">
-  <small>Kostenlose Modelle enden auf „:free“. Aktuelle Namen stehen auf openrouter.ai/models.</small>
+  <small>Gratis-Standard: openrouter/free. Kostenlose Modelle enden auf „:free“ (siehe openrouter.ai/models, Filter „Free“).</small>
   <label>ElevenLabs-Key</label><input id="xiKey" type="password" autocomplete="off" placeholder="Key einfügen">
-  <label>Stimmen-ID (Jonas)</label><input id="voice" autocomplete="off" autocapitalize="off" placeholder="wird automatisch eingetragen">
+  <label>Stimmen-ID</label><input id="voice" autocomplete="off" autocapitalize="off" placeholder="leer = Browser-Stimme">
+  <p><button id="free">Gratis-Stimmen anzeigen</button></p>
+  <select id="vsel" style="display:none"></select>
   <p><button id="find">Stimme „Jonas“ suchen</button></p>
+  <small>Jonas stammt aus der Stimmen-Bibliothek und braucht einen bezahlten ElevenLabs-Plan (oder 5 $ Guthaben). Im Gratis-Plan: eine Gratis-Stimme wählen.</small>
   <small id="vstat"></small>
   <p><button id="wipe">Alle Keys von diesem Gerät löschen</button></p>
   <small>Keys werden nur im localStorage dieses Geräts gespeichert und nur an OpenRouter bzw. ElevenLabs gesendet.</small>
@@ -59,8 +63,10 @@ small{color:#8a9099;display:block;margin-top:6px}
 const $=id=>document.getElementById(id);
 const LS='apollo_settings';
 const SYS='Du bist Apollo, ein hilfreicher Sprachassistent. Antworte auf Deutsch, kurz und natürlich (max. 3 Sätze), ohne Markdown.';
+const DEFAULT_MODEL='openrouter/free';
 function load(){try{return JSON.parse(localStorage.getItem(LS))||{}}catch(e){return{}}}
-const S=Object.assign({provider:'openrouter',model:'meta-llama/llama-3.3-70b-instruct:free',orKey:'',xiKey:'',voiceId:''},load());
+const S=Object.assign({provider:'openrouter',model:DEFAULT_MODEL,orKey:'',xiKey:'',voiceId:''},load());
+if(S.model==='meta-llama/llama-3.3-70b-instruct:free')S.model=DEFAULT_MODEL; // alter, nicht mehr gratis nutzbarer Standard
 function save(){try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){say('sys','Speichern nicht möglich (privater Modus?)')}}
 
 /* JSON-Helfer mit sauberer Fehlermeldung */
@@ -82,12 +88,12 @@ async function openaiChat(url,key,model,messages){
 }
 const PROVIDERS={
   openrouter:{label:'OpenRouter',key:()=>S.orKey,
-    chat:m=>openaiChat('https://openrouter.ai/api/v1/chat/completions',S.orKey,S.model,m)}
+    chat:m=>openaiChat('https://openrouter.ai/api/v1/chat/completions',S.orKey,S.model||DEFAULT_MODEL,m)}
 };
 
 /* ---------- UI ---------- */
 const LABELS={idle:'Tippen zum Sprechen',listening:'Ich höre … (nochmal tippen = fertig)',thinking:'Ich denke …',speaking:'Ich spreche … (tippen = stopp)'};
-let state='idle',rec=null,mr=null;const hist=[];
+let state='idle',rec=null,mr=null,ttsFail=false;const hist=[];
 function setState(s){state=s;$('orb').className=s;$('state').textContent=LABELS[s]}
 function say(role,text){const d=document.createElement('div');d.className='m '+role;d.textContent=text;$('log').appendChild(d);$('log').scrollTop=1e9}
 const player=$('player');
@@ -131,8 +137,16 @@ async function listenScribe(){
 function stopListen(){try{if(rec)rec.stop()}catch(e){}try{if(mr&&mr.state==='recording')mr.stop()}catch(e){}}
 
 /* ---------- SPRECHEN ---------- */
+function browserSpeak(text){
+  try{
+    setState('speaking');
+    const u=new SpeechSynthesisUtterance(text);u.lang='de-DE';
+    u.onend=u.onerror=()=>setState('idle');
+    speechSynthesis.cancel();speechSynthesis.speak(u);
+  }catch(e){setState('idle')}
+}
 async function speak(text){
-  if(!S.xiKey||!S.voiceId)return;
+  if(!S.xiKey||!S.voiceId||ttsFail){browserSpeak(text);return}
   setState('speaking');
   try{
     const r=await fetch('https://api.elevenlabs.io/v1/text-to-speech/'+encodeURIComponent(S.voiceId)+'?output_format=mp3_44100_128',
@@ -141,7 +155,26 @@ async function speak(text){
     const url=URL.createObjectURL(await r.blob());
     player.onended=()=>{URL.revokeObjectURL(url);setState('idle')};
     player.src=url;await player.play();
-  }catch(e){say('sys','Sprechen: '+e.message);setState('idle')}
+  }catch(e){
+    ttsFail=true; // bis zur nächsten Änderung von Key/Stimme nicht erneut versuchen
+    say('sys','ElevenLabs: '+e.message+' → ab jetzt Browser-Stimme');
+    browserSpeak(text);
+  }
+}
+async function freeVoices(){
+  const st=t=>$('vstat').textContent=t;
+  if(!S.xiKey){st('Bitte zuerst den ElevenLabs-Key eintragen.');return}
+  st('Lade …');
+  try{
+    const j=await jf('https://api.elevenlabs.io/v2/voices?page_size=100',{headers:{'xi-api-key':S.xiKey}});
+    const list=(j.voices||[]).filter(v=>v.category==='premade');
+    if(!list.length){st('Keine Standard-Stimmen gefunden.');return}
+    const sel=$('vsel');sel.innerHTML='';
+    list.forEach(v=>{const o=document.createElement('option');o.value=v.voice_id;o.textContent=v.name;sel.appendChild(o)});
+    sel.style.display='block';
+    sel.onchange=()=>{S.voiceId=$('voice').value=sel.value;ttsFail=false;save();st('Gewählt: '+sel.options[sel.selectedIndex].text)};
+    sel.onchange();
+  }catch(e){st('Fehler: '+e.message)}
 }
 async function findVoice(){
   const st=t=>$('vstat').textContent=t;
@@ -156,8 +189,8 @@ async function findVoice(){
       v=(j.voices||[]).find(x=>/jonas/i.test(x.name));src='Stimmen-Bibliothek';
     }
     if(!v){st('Keine Stimme „Jonas“ gefunden. ID von Hand eintragen.');return}
-    S.voiceId=$('voice').value=v.voice_id;save();
-    st('Gefunden: '+v.name+' ('+src+')'+(src==='Stimmen-Bibliothek'?'. Falls Sprechen scheitert: Stimme in ElevenLabs erst zu „Meine Stimmen“ hinzufügen.':''));
+    S.voiceId=$('voice').value=v.voice_id;ttsFail=false;save();
+    st('Gefunden: '+v.name+' ('+src+')'+(src==='Stimmen-Bibliothek'?'. Achtung: Bibliotheks-Stimmen brauchen einen bezahlten Plan bzw. 5 $ Guthaben.':''));
   }catch(e){st('Fehler: '+e.message)}
 }
 
@@ -170,7 +203,7 @@ async function handle(text){
   setState('thinking');
   try{
     const reply=await p.chat([{role:'system',content:SYS}].concat(hist.slice(-20)));
-    if(!reply)throw new Error('Leere Antwort');
+    if(!reply)throw new Error('Leere Antwort. Nochmal versuchen oder ein anderes Modell wählen.');
     hist.push({role:'assistant',content:reply});say('bot',reply);
     await speak(reply);
   }catch(e){say('sys','Denken: '+e.message)}
@@ -181,7 +214,7 @@ async function handle(text){
 $('orb').onclick=()=>{
   unlock();
   if(state==='listening'){stopListen();return}
-  if(state==='speaking'){player.pause();setState('idle');return}
+  if(state==='speaking'){player.pause();try{speechSynthesis.cancel()}catch(e){}setState('idle');return}
   if(state==='thinking')return;
   listen();
 };
@@ -190,10 +223,12 @@ $('txt').onkeydown=e=>{if(e.key==='Enter')$('send').click()};
 $('gear').onclick=()=>$('set').classList.add('open');
 $('close').onclick=()=>$('set').classList.remove('open');
 $('find').onclick=findVoice;
-$('wipe').onclick=()=>{try{localStorage.removeItem(LS)}catch(e){}S.orKey=S.xiKey=S.voiceId='';['orKey','xiKey','voice'].forEach(i=>$(i).value='');$('vstat').textContent='Gelöscht.'};
+$('free').onclick=freeVoices;
+$('wipe').onclick=()=>{try{localStorage.removeItem(LS)}catch(e){}S.orKey=S.xiKey=S.voiceId='';S.model=DEFAULT_MODEL;['orKey','xiKey','voice'].forEach(i=>$(i).value='');$('model').value=DEFAULT_MODEL;$('vstat').textContent='Gelöscht.'};
 for(const k in PROVIDERS){const o=document.createElement('option');o.value=k;o.textContent=PROVIDERS[k].label;$('provider').appendChild(o)}
 [['provider','provider'],['orKey','orKey'],['model','model'],['xiKey','xiKey'],['voice','voiceId']].forEach(([id,k])=>{
-  $(id).value=S[k];$(id).onchange=$(id).oninput=()=>{S[k]=$(id).value.trim();save()};
+  $(id).value=S[k];
+  $(id).onchange=$(id).oninput=()=>{S[k]=$(id).value.trim();if(k==='voiceId'||k==='xiKey')ttsFail=false;save()};
 });
 setState('idle');
 say('sys','Zum Start: ⚙ öffnen und die Keys eintragen.');
